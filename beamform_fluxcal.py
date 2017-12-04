@@ -112,6 +112,9 @@ parser.add_option('--backend-args',
                   help="Arguments for backend processing")
 parser.add_option('--drift-scan', action='store_true', default=False,
                   help="Perform drift scan instead of standard track (default=no)")
+parser.add_option('--noise-source', type=str, default=None,
+                  help="Initiate a noise diode pattern on all antennas, '<cycle_length_sec>,<on_fraction>'")
+nd_cycles = ['all', 'cycle']
 parser.add_option('--noise-cycle', type=str, default=None,
                   help="How to apply the noise diode pattern: \
 '%s' to set the pattern to all dishes simultaneously (default), \
@@ -122,8 +125,10 @@ parser.add_option('--cal-offset', type='float', default=1.0,
 parser.add_option('--cal', type='choice', default='poln',
                   choices=['poln','flux'],
                   help="Type of cal (default=%default)")
+
 # Set default value for any option (both standard and experiment-specific options)
 parser.set_defaults(description='Beamformer observation', nd_params='off')
+
 # Parse the command line
 opts, args = parser.parse_args()
 
@@ -163,6 +168,9 @@ with verify_and_connect(opts) as kat:
                 user_logger.warning('  input %r weight could not be set', inp)
 
     # We are only interested in first target
+    target_name=args[:1][0]
+    print target_name
+
     user_logger.info('Looking up main beamformer target...')
     target = collect_targets(kat, args[:1]).targets[0]
 
@@ -180,6 +188,8 @@ with verify_and_connect(opts) as kat:
     # Save script parameters before session capture-init's the SDP subsystem
     sdp = SessionSDP(kat)
     telstate = sdp.telstate
+    #telstate = get_telstate(kat.sdp, kat.sub)
+
     script_args = vars(opts)
     script_args['targets'] = args
     telstate.add('obs_script_arguments', script_args)
@@ -213,21 +223,69 @@ with verify_and_connect(opts) as kat:
         #print "kat.anc.req.ptuse_proposal_id returned " + str(reply)
 
         # check if the opts have noise diod
-#        if hasattr(opts, 'nd_params'):
-#          if float(opts.nd_params['period']) > 0:
-#            period = float(opts.nd_params['period'])
-#            freq = 1.0 / period
-#            print "kat.ptuse_1.req.ptuse_cal_freq (" + data_product_id + ", " + beam_id + ", " + str(freq) + ")"
-#            reply = kat.ptuse_1.req.ptuse_cal_freq (data_product_id, beam_id, freq)
-#            print "kat.ptuse_1.req.ptuse_cal_freq returned " + str(reply)
+    #    if hasattr(opts, 'nd_params'):
+    #      if float(opts.nd_params['period']) > 0:
+    #        period = float(opts.nd_params['period'])
+    #        freq = 1.0 / period
+    #        print "kat.ptuse_1.req.ptuse_cal_freq (" + data_product_id + ", " + beam_id + ", " + str(freq) + ")"
+    #        reply = kat.ptuse_1.req.ptuse_cal_freq (data_product_id, beam_id, freq)
+    #        print "kat.ptuse_1.req.ptuse_cal_freq returned " + str(reply)
 
         # Force delay tracking to be on
         opts.no_delays = False
         session.standard_setup(**vars(opts))
         # Get onto beamformer target
 
+        user_logger.info('Set noise-source pattern')
+        if opts.noise_source is not None:
+            import time
+            cycle_length, on_fraction=np.array([el.strip() for el in opts.noise_source.split(',')], dtype=float)
+            user_logger.info('Setting noise source pattern to %.3f [sec], %.3f fraction on' % (cycle_length, on_fraction))
+            if opts.noise_cycle is None or opts.noise_cycle == 'all':
+                # Noise Diodes are triggered on all antennas in array simultaneously
+                timestamp = time.time() + 1  # add a second to ensure all digitisers set at the same time
+                user_logger.info('Set all noise diode with timestamp %d (%s)' % (int(timestamp), time.ctime(timestamp)))
+                kat.ants.req.dig_noise_source(timestamp, on_fraction, cycle_length)
+            elif opts.noise_cycle in bf_ants:
+                # Noise Diodes are triggered for only one antenna in the array
+                ant_name = opts.noise_cycle.strip()
+                user_logger.info('Set noise diode for antenna %s' % ant_name)
+                ped = getattr(kat, ant_name)
+                ped.req.dig_noise_source('now', on_fraction, cycle_length)
+            elif opts.noise_cycle == 'cycle':
+                timestamp = time.time() + 1  # add a second to ensure all digitisers set at the same time
+                for ant in bf_ants:
+                    user_logger.info('Set noise diode for antenna %s with timestamp %f' % (ant, timestamp))
+                    ped = getattr(kat, ant)
+                    ped.req.dig_noise_source(timestamp, on_fraction, cycle_length)
+                    timestamp += cycle_length*on_fraction
+            else:
+                raise ValueError("Unknown ND cycle option, please select: %s or any one of %s" % (', '.join(nd_cycles), ', '.join(bf_ants)))
+            #tell dspsr to expect cal data
+            if float(cycle_length) > 0:
+               period = float(cycle_length)
+               freq = 1.0 / period
+               print "kat.ptuse_1.req.ptuse_cal_freq (" + data_product_id + ", " + beam_id + ", " + str(freq) + ")"
+               reply = kat.ptuse_1.req.ptuse_cal_freq (data_product_id, beam_id, freq)
+               print "kat.ptuse_1.req.ptuse_cal_freq returned " + str(reply)
+
         # Temporary haxx to make sure that AP accepts the upcoming track request
         time.sleep(2)
+        timenow = katpoint.Timestamp()
+
+        ra, dec = target.apparent_radec(timestamp=timenow)
+        print target
+        print "ra %f ,dec %f"  %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
+        dec2 = dec +katpoint.deg2rad(1)
+        print dec2,dec
+
+        print "newra %f newdec %f" %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
+        Ntarget=katpoint.construct_radec_target(ra, dec2)
+        Ntarget.antenna = bf_ants
+        Ntarget.name=target_name+'_R'
+        target=Ntarget
+        print target
+        print target.name
 
         # Get onto beamformer target
         session.track(target, duration=5)
@@ -240,25 +298,37 @@ with verify_and_connect(opts) as kat:
             # Go to transit point so long
             session.track(target, duration=0)
         # Only start capturing once we are on target
-        session.capture_start()
 
-        print "sleeping 10 secs, will be removed later in dpc is not asynchronous"
-        time.sleep(10)
+        for target in sources:
+            print target
+            user_logger.info('Observing target %s' % (target.name))
+            # Get onto beamformer target
+            session.track(target, duration=5)
+            session.capture_start()
+
+
+            print "sleeping 10 secs, will be removed later in dpc is not asynchronous"
+            time.sleep(10)
 
         # for targets in list
-        print "kat.ptuse_1.req.ptuse_target_start (" + data_product_id + ", " + beam_id + ", " + target.name + ")"
-        reply = kat.ptuse_1.req.ptuse_target_start (data_product_id, beam_id, target.name)
-        print "kat.ptuse_1.req.ptuse_target_start returned " + str(reply)
+            print "kat.ptuse_1.req.ptuse_target_start (" + data_product_id + ", " + beam_id + ", " + target.name + ")"
+            reply = kat.ptuse_1.req.ptuse_target_start (data_product_id, beam_id, target.name)
+            print "kat.ptuse_1.req.ptuse_target_start returned " + str(reply)
 
-        # start PTUSE via the handles in the kat.ant.reqptuse
-        # Basic observation
-        session.label('track')
-        session.track(target, duration=opts.target_duration)
+            # start PTUSE via the handles in the kat.ant.reqptuse
+            # Basic observation
+            session.label('track')
+            session.track(target, duration=opts.target_duration)
 
-        # stop PTUSE
-        print "kat.ptuse_1.req.ptuse_target_stop (" + data_product_id + ", " + beam_id + ")"
-        reply = kat.ptuse_1.req.ptuse_target_stop (data_product_id, beam_id)
-        print reply
+            # stop PTUSE
+            print "kat.ptuse_1.req.ptuse_target_stop (" + data_product_id + ", " + beam_id + ")"
+            reply = kat.ptuse_1.req.ptuse_target_stop (data_product_id, beam_id)
+            print reply
 
-        print "Allowing PTUSE 5 seconds to conclude observation"
-        time.sleep (5)
+            print "Allowing PTUSE 5 seconds to conclude observation"
+            time.sleep (5)
+
+        if opts.noise_source is not None:
+#                user_logger.info('Ending noise source pattern')
+                kat.ants.req.dig_noise_source('now', 0)
+
