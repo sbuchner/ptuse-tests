@@ -15,6 +15,20 @@ from katuilib import ScheduleBlockTypes, configure_obs
 
 
 DEFAULTS = dict(
+    phaseupfb=dict(
+        owner='sarah',
+        description_format='MKAIV-405 Generic AR1 flatten {}',
+        instruction_set=(
+            "run-obs-script /home/kat/katsdpscripts/observation/bf_phaseup.py "),
+        time="-t 600",
+        params="--horizon=20 --flatten-bandpass -n 'off'",
+        ids="--proposal-id='MKAIV-330' --program-block-id='MKAIV-405' --issue-id='MKAIV-405'",
+        notes=("This phase up can be run for all imaging observations ... "
+               "in all modes. There is no need to specify the target or "
+               "default gains as these are chosen by the script."),
+        antenna_spec='available',
+        controlled_resources='cbf,sdp'
+        ),
     phaseup=dict(
         owner='sarah',
         description_format='MKAIV-405 Generic AR1 {}',
@@ -29,6 +43,19 @@ DEFAULTS = dict(
         antenna_spec='available',
         controlled_resources='cbf,sdp'
         ),
+    delaycal=dict(
+        owner='sarah',
+        description_format='MKAIV-405 Generic AR1 {}',
+        instruction_set=(
+            "run-obs-script /home/kat/katsdpscripts/observation/calibrate_delays.py  '/home/kat/katsdpcatalogues/three_calib.csv' "),
+        time="-t 64",
+        params="--horizon=20 -n 'off'",
+        ids="--proposal-id='MKAIV-584' --program-block-id='MKAIV-584' --issue-id='MKAIV-584'",
+        notes=(""),
+        antenna_spec='available',
+        controlled_resources='cbf,sdp'
+        ),
+ 
     target=dict(
         owner='sarah',
         description_format='MKAIV-387: CBF {}',
@@ -154,6 +181,10 @@ def read_group_from_csv(filename):
           if len(alist)>0:
               listoflists.append(alist)
               alist=[]
+       if row['target'] == "phaseupfb":
+          if len(alist)>0:
+              listoflists.append(alist)
+              alist=[]
        if row['time'] == None:
           alist.append({"target":row['target']})
        else:
@@ -169,6 +200,8 @@ def populate_ptuse_sbs(obs, group,start="now"):
     # bc4k sub-array - as many dishes from the core as possible
 
 
+
+
     def specific_or_default(label):
         """
         Get the label from sb_params else get it from sb_defaults
@@ -177,6 +210,7 @@ def populate_ptuse_sbs(obs, group,start="now"):
         return sb_params.get(label, sb_defaults.get(label, ""))
 
     # create the schedule blocks in the database
+    obstime=start
     created_sbs = []
     for sequence, sb_group in enumerate(group):
         for order, sb_params in enumerate(sb_group):
@@ -184,18 +218,24 @@ def populate_ptuse_sbs(obs, group,start="now"):
             if sb_type == "phaseup":
                 sb_defaults = DEFAULTS["phaseup"]
             else:
-                sb_defaults = DEFAULTS["target"]
+                if sb_type == "phaseupfb":
+		    sb_defaults = DEFAULTS["phaseupfb"]
+		else:
+		    if sb_type == "delaycal":
+	               sb_defaults = DEFAULTS["delaycal"]
+                    else:
+                       sb_defaults = DEFAULTS["target"]
             sb = obs.sb.new(
                 owner=specific_or_default('owner'),
                 antenna_spec=specific_or_default('antenna_spec'),
                 controlled_resources=specific_or_default('controlled_resources'),
                 pb_id=specific_or_default('pb_id') or None)
-            if start != "default":
-		obs.sb.desired_start_time=start
+            #if start != "default":
+	#	obs.sb.desired_start_time=start
             obs.sb.type = ScheduleBlockTypes.OBSERVATION
             obs.sb.description = specific_or_default(
                 'description_format').format(sb_params.get("target"))
-            if sb_type == "phaseup":
+            if ((sb_type == "phaseup") or (sb_type == "phaseupfb")):
 	        instruction_set = " ".join([specific_or_default('instruction_set'),
                    specific_or_default('time'), 
                    specific_or_default('params'), 
@@ -244,6 +284,10 @@ def parse_cmd_line():
         '-v', '--verbose',
         help="Show additional info",
         action="store_true")
+    parser.add_argument(
+	'--pbdesc',
+	help="decription for program block",
+	metavar="pbdesc")
     config = vars(parser.parse_args())
     return config
 
@@ -257,19 +301,22 @@ def main():
 	sb_groups_file=read_group_from_csv(config["file"])
         print sb_groups_file
 	group=sb_groups_file
+        
     else:
         print config["groupkey"]
         group_key=config["groupkey"]
 	group=GROUPS[group_key]
     
     obs.pb.new(owner="sarah")
+    obs.pb.description=config["pbdesc"]
+    obs.pb.desired_start_time=config["starttime"]
     created_sbs = populate_ptuse_sbs(obs, group,config["starttime"])
     for sb in created_sbs:
 	print sb
-      #  obs.sb.sub_nr=1
+     #  obs.sb.sub_nr=1
         obs.pb.assign_sb(sb)
-        obs.sb.load(sb)
-        obs.sb.schedule(1)
+     #   obs.sb.load(sb)
+     #   obs.sb.schedule(1)
     obs.pb.to_defined()
     obs.pb.to_approved()
     
