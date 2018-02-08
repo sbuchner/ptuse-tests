@@ -98,8 +98,8 @@ opts, args = parser.parse_args()
 
 # Set of targets with flux models
 J1934 = 'PKS 1934-63 | J1939-6342, radec, 19:39:25.03, -63:42:45.7, (200.0 12000.0 -30.7667 26.4908 -7.0977 0.605334)' 
-J0408 = 'PKS 0408-65 | J0408-6545, radec, 4:08:20.38, -65:45:09.1, (800.0 8400.0 -3.708 3.807 -0.7202)'
-J1331 = '3C286      | J1331+3030, radec, 13:31:08.29, +30:30:33.0,(800.0 43200.0 0.956 0.584 -0.1644)'
+#J0408 = 'PKS 0408-65 | J0408-6545, radec, 4:08:20.38, -65:45:09.1, (800.0 8400.0 -3.708 3.807 -0.7202)'
+#J1331 = '3C286      | J1331+3030, radec, 13:31:08.29, +30:30:33.0,(800.0 43200.0 0.956 0.584 -0.1644)'
 
 
 # Check options and build KAT configuration, connecting to proxies and devices
@@ -107,8 +107,8 @@ with verify_and_connect(opts) as kat:
     if len(args) == 0:
         observation_sources = katpoint.Catalogue(antenna=kat.sources.antenna)
         observation_sources.add(J1934)
-        observation_sources.add(J0408)
-        observation_sources.add(J1331)
+#        observation_sources.add(J0408)
+#        observation_sources.add(J1331)
     else:
         observation_sources = collect_targets(kat, args)
     if opts.reconfigure_sdp:
@@ -128,6 +128,8 @@ with verify_and_connect(opts) as kat:
 
         for target in [observation_sources.sort('el').targets[-1]]:
             target.add_tags('bfcal single_accumulation')
+            print target.flux_model
+            print target.name
             if not opts.default_gain:
                 channels = 32768 if session.product.endswith('32k') else 4096
                 opts.default_gain = DEFAULT_GAIN[channels]
