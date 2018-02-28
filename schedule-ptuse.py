@@ -29,6 +29,20 @@ DEFAULTS = dict(
         antenna_spec='available',
         controlled_resources='cbf,sdp'
         ),
+     phaseupfb=dict(
+        owner='sarah',
+        description_format='COMM-291 Phaseup with flatten bandpass {}',
+        instruction_set=(
+            "run-obs-script /home/kat/katsdpscripts/observation/bf_phaseup.py "),
+        time="-t 600",
+        params="--horizon=20 --flatten-bandpass -n 'off'",
+        ids="--proposal-id='MKAIV-330' --program-block-id='MKAIV-405' --issue-id='COMM-291'",
+        notes=("This phase up can be run for all imaging observations ... "
+               "in all modes. There is no need to specify the target or "
+               "default gains as these are chosen by the script."),
+        antenna_spec='available',
+        controlled_resources='cbf,sdp'
+        ),
     target=dict(
         owner='sarah',
         description_format='MKAIV-387: CBF {}',
