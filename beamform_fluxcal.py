@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # Dual polarisation beamforming: Track single pulsar target for beamforming.
+# Using "V2" of the PTUSE KATCP API
 
 import argparse
 
@@ -122,43 +123,62 @@ parser.add_option('--noise-cycle', type=str, default=None,
 'm0xx' to set the pattern to a single selected antenna." % (nd_cycles[0], nd_cycles[1]))
 parser.add_option('--cal-offset', type='float', default=1.0,
                   help="Offset in degrees to do cal")
-parser.add_option('--cal', type='choice', default='poln',
-                  choices=['poln','flux'],
+parser.add_option('--cal', type='choice', default='flux',
+                  choices=['poln','flux','fluxN','fluxS'],
                   help="Type of cal (default=%default)")
 
 # Set default value for any option (both standard and experiment-specific options)
 parser.set_defaults(description='Beamformer observation', nd_params='off')
-
 # Parse the command line
 opts, args = parser.parse_args()
 
-# Very bad hack to circumvent SB verification issues
-# with anything other than session objects (e.g. kat.data).
-# The *near future* will be modelled CBF sessions.
-# The *distant future* will be fully simulated sessions via kattelmod.
-if opts.dry_run:
-    import sys
-    sys.exit(0)
 
 # Check options and arguments and connect to KAT proxies and devices
 if len(args) == 0:
     raise ValueError("Please specify the target")
 
 with verify_and_connect(opts) as kat:
+
+    # check for PTUSE proxies in the subarray
+    ptuses = [kat.children[name]
+              for name in sorted(kat.children) if name.startswith('ptuse')]
+    if len(ptuses) == 0:
+        raise ValueError("This script requires a PTUSE proxy")
+    elif len(ptuses) > 1:
+        # for now keep script simple and only use first proxy
+        ptuse = ptuses[0]
+        user_logger.warning('Found PTUSE proxies: %s - only using: %s',
+                            ptuses, ptuse.name)
+    else:
+        ptuse = ptuses[0]
+        user_logger.info('Using PTUSE proxy: %s', ptuse.name)
+
     bf_ants = opts.ants.split(',') if opts.ants else [ant.name for ant in kat.ants]
     cbf = SessionCBF(kat)
+    # Special hack for Lab CBF - set to zero on site
+    # TODO: stop hacking, or make this a command line option
+    freq_delta_hack = 0
+    if freq_delta_hack:
+        user_logger.warning('Hack: Adjusting beam centre frequency by %s MHz for lab',
+                            freq_delta_hack)
     for stream in cbf.beamformers:
         reply = stream.req.passband(int((opts.beam_bandwidth) * 1e6),
-                                    int((opts.beam_centre_freq) * 1e6))
+                                    int((opts.beam_centre_freq - freq_delta_hack) * 1e6))
         if reply.succeeded:
-            actual_bandwidth = float(reply.messages[0].arguments[2])
-            actual_centre_freq = float(reply.messages[0].arguments[3])
-            user_logger.info("Beamformer %r has bandwidth %g Hz and centre freq %g Hz",
+            if not opts.dry_run:
+                actual_bandwidth = float(reply.messages[0].arguments[2])
+                actual_centre_freq = float(reply.messages[0].arguments[3])
+            else:
+                # dry-run message won't be valid, so fake it
+                user_logger.info("DRY-RUN - faking requests for %s", stream)
+                actual_bandwidth = float(int((opts.beam_bandwidth) * 1e6))
+                actual_centre_freq = float(int((opts.beam_centre_freq) * 1e6))
+            user_logger.info("Beamformer %s has bandwidth %g Hz and centre freq %g Hz",
                              stream, actual_bandwidth, actual_centre_freq)
         else:
-            raise ValueError("Could not set beamformer %r passband - (%s)" %
+            raise ValueError("Could not set beamformer %s passband - (%s)" %
                              (stream, ' '.join(reply.messages[0].arguments)))
-        user_logger.info('Setting beamformer weights for stream %r:', stream)
+        user_logger.info('Setting beamformer weights for stream %s:', stream)
         for inp in stream.inputs:
             weight = 1.0 / np.sqrt(len(bf_ants)) if inp[:-1] in bf_ants else 0.0
             reply = stream.req.weights(inp, weight)
@@ -166,18 +186,6 @@ with verify_and_connect(opts) as kat:
                 user_logger.info('  input %r got weight %f', inp, weight)
             else:
                 user_logger.warning('  input %r weight could not be set', inp)
-
-    # We are only interested in first target
-    target_name=args[:1][0]
-    print target_name
-
-    user_logger.info('Looking up main beamformer target...')
-    target = collect_targets(kat, args[:1]).targets[0]
-
-    # Ensure that the target is up
-    target_elevation = np.degrees(target.azel()[1])
-    if target_elevation < opts.horizon:
-        raise ValueError("The target %r is below the horizon" % (target.description,))
 
     # Verify backend_args
     if opts.backend == "dspsr" and opts.backend_args:
@@ -188,8 +196,6 @@ with verify_and_connect(opts) as kat:
     # Save script parameters before session capture-init's the SDP subsystem
     sdp = SessionSDP(kat)
     telstate = sdp.telstate
-    #telstate = get_telstate(kat.sdp, kat.sub)
-
     script_args = vars(opts)
     script_args['targets'] = args
     telstate.add('obs_script_arguments', script_args)
@@ -197,39 +203,22 @@ with verify_and_connect(opts) as kat:
     # Start capture session
     with start_session(kat, **vars(opts)) as session:
 
-        # TODO:  this product ID should be provided by the PTUSE data proxy
-        sub_nr = kat.sub.sensor.sub_nr.get_value()
-        product = kat.sub.sensor.product.get_value()
-        data_product_id = "array_%s_%s" % (sub_nr, product)
+        # We are only interested in first target
+        user_logger.info('Looking up main beamformer target...')
+        target = collect_targets(kat, args[:1]).targets[0]
 
-        # certain constants that are ignored by PTUSE
-        antenna_list = "None"
-        dump_time = 0.25
+        # Ensure that the target is up
+        target_elevation = np.degrees(target.azel()[1])
+        if target_elevation < opts.horizon:
+            if not opts.dry_run:
+                raise ValueError("The target %r is below the horizon"
+                                 % (target.description, ))
+            else:
+                user_logger.warn("The target is below the horizon, "
+                                 "but ignoring for dry-run!")
 
-        # certain constants that are checked by PTUSE
-        n_channels = 4096
-        if opts.beam_bandwidth < 430:
-            n_channels = 2048
-        n_beams = 1
-        beam_id = "1"
-
-        # inject the proposal ID
-        proposal_id = "None"
-        if hasattr(opts, 'proposal_id'):
-          proposal_id = str(opts.proposal_id)
-        print "kat.ptuse_1.req.ptuse_proposal_id (" + data_product_id + ", " + beam_id + ", " + proposal_id +")"
-        #Commenting out for now, don't think that lab has this sensor at the moment
-        #reply = kat.ptuse_1.req.ptuse_proposal_id (data_product_id, beam_id, proposal_id)
-        #print "kat.anc.req.ptuse_proposal_id returned " + str(reply)
-
-        # check if the opts have noise diod
-    #    if hasattr(opts, 'nd_params'):
-    #      if float(opts.nd_params['period']) > 0:
-    #        period = float(opts.nd_params['period'])
-    #        freq = 1.0 / period
-    #        print "kat.ptuse_1.req.ptuse_cal_freq (" + data_product_id + ", " + beam_id + ", " + str(freq) + ")"
-    #        reply = kat.ptuse_1.req.ptuse_cal_freq (data_product_id, beam_id, freq)
-    #        print "kat.ptuse_1.req.ptuse_cal_freq returned " + str(reply)
+        data_product_id = ptuse.sensor.subarray_product_id.get_value()
+        user_logger.info('Data product ID: %s', data_product_id)
 
         # Force delay tracking to be on
         opts.no_delays = False
@@ -240,6 +229,7 @@ with verify_and_connect(opts) as kat:
         if opts.noise_source is not None:
             import time
             cycle_length, on_fraction=np.array([el.strip() for el in opts.noise_source.split(',')], dtype=float)
+            print cycle_length,on_fraction
             user_logger.info('Setting noise source pattern to %.3f [sec], %.3f fraction on' % (cycle_length, on_fraction))
             if opts.noise_cycle is None or opts.noise_cycle == 'all':
                 # Noise Diodes are triggered on all antennas in array simultaneously
@@ -271,21 +261,54 @@ with verify_and_connect(opts) as kat:
 
         # Temporary haxx to make sure that AP accepts the upcoming track request
         time.sleep(2)
-        timenow = katpoint.Timestamp()
 
-        ra, dec = target.apparent_radec(timestamp=timenow)
-        print target
-        print "ra %f ,dec %f"  %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
-        dec2 = dec +katpoint.deg2rad(1)
-        print dec2,dec
+        if opts.cal == 'flux':
+           timenow = katpoint.Timestamp()
+        
+           sources = katpoint.Catalogue(add_specials=False)
+           user_logger.info('Performing flux calibration')
+           ra, dec = target.apparent_radec(timestamp=timenow)
+           targetName=target.name.replace(" ","")
+           print targetName
+           target.name = targetName+'_O'
+           sources.add(target)
 
-        print "newra %f newdec %f" %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
-        Ntarget=katpoint.construct_radec_target(ra, dec2)
-        Ntarget.antenna = bf_ants
-        Ntarget.name=target_name+'_R'
-        target=Ntarget
-        print target
-        print target.name
+
+        if opts.cal == 'fluxN':
+           timenow = katpoint.Timestamp()
+        
+           sources = katpoint.Catalogue(add_specials=False)
+           user_logger.info('Performing flux calibration')
+           ra, dec = target.apparent_radec(timestamp=timenow)
+           print target
+           print "ra %f ,dec %f"  %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
+           dec2 = dec +katpoint.deg2rad(1)
+           print dec2,dec
+           decS = dec -katpoint.deg2rad(1)
+           targetName=target.name.replace(" ","")
+           print targetName
+	   print "newra %f newdec %f" %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
+           Ntarget=katpoint.construct_radec_target(ra, dec2)
+           Ntarget.antenna = bf_ants
+           Ntarget.name=targetName+'_N'
+           sources.add(Ntarget)
+
+        if opts.cal == 'fluxS':
+           timenow = katpoint.Timestamp()
+           sources = katpoint.Catalogue(add_specials=False)
+ 
+           user_logger.info('Performing flux calibration')
+           ra, dec = target.apparent_radec(timestamp=timenow)
+           print target
+           print "ra %f ,dec %f"  %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
+           dec2 = dec -katpoint.deg2rad(1)
+           targetName=target.name.replace(" ","")
+           print targetName
+	   print "newra %f newdec %f" %(katpoint.rad2deg(ra),katpoint.rad2deg(dec))
+           Starget=katpoint.construct_radec_target(ra, dec2)
+           Starget.antenna = bf_ants
+           Starget.name=targetName+'_S'
+           sources.add(Starget)
 
         # Get onto beamformer target
         session.track(target, duration=5)
@@ -298,37 +321,30 @@ with verify_and_connect(opts) as kat:
             # Go to transit point so long
             session.track(target, duration=0)
         # Only start capturing once we are on target
+        session.capture_start()
 
-        for target in sources:
-            print target
-            user_logger.info('Observing target %s' % (target.name))
-            # Get onto beamformer target
-            session.track(target, duration=5)
-            session.capture_start()
-
-
-            print "sleeping 10 secs, will be removed later in dpc is not asynchronous"
-            time.sleep(10)
+        user_logger.info("sleeping 10 secs, will be removed later in dpc "
+                         "is not asynchronous")
+        time.sleep(10)
 
         # for targets in list
-            print "kat.ptuse_1.req.ptuse_target_start (" + data_product_id + ", " + beam_id + ", " + target.name + ")"
-            reply = kat.ptuse_1.req.ptuse_target_start (data_product_id, beam_id, target.name)
-            print "kat.ptuse_1.req.ptuse_target_start returned " + str(reply)
+        user_logger.info("ptuse.req.ptuse_target_start(%s)", target.name)
+        reply = ptuse.req.ptuse_target_start(target.name)
+        user_logger.info("ptuse.req.ptuse_target_start returned %s", reply)
 
-            # start PTUSE via the handles in the kat.ant.reqptuse
-            # Basic observation
-            session.label('track')
-            session.track(target, duration=opts.target_duration)
+        # start PTUSE via the handles in the kat.ant.reqptuse
+        # Basic observation
+        session.label('track')
+        session.track(target, duration=opts.target_duration)
 
-            # stop PTUSE
-            print "kat.ptuse_1.req.ptuse_target_stop (" + data_product_id + ", " + beam_id + ")"
-            reply = kat.ptuse_1.req.ptuse_target_stop (data_product_id, beam_id)
-            print reply
+        # stop PTUSE
+        user_logger.info("ptuse.req.ptuse_target_stop()")
+        reply = ptuse.req.ptuse_target_stop()
+        user_logger.info("ptuse.req.ptuse_target_stop returned %s", reply)
 
-            print "Allowing PTUSE 5 seconds to conclude observation"
-            time.sleep (5)
+        user_logger.info("Allowing PTUSE 5 seconds to conclude observation")
+        time.sleep (5)
 
         if opts.noise_source is not None:
 #                user_logger.info('Ending noise source pattern')
                 kat.ants.req.dig_noise_source('now', 0)
-
